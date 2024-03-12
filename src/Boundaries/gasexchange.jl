@@ -123,23 +123,37 @@ OCMIP_default = pCO₂(OCMIP_solubility,
 ##### Gas exchange model of [Wanninkhof1992](@citet)
 #####
 # TODO: Implement Ho et al. 2006 wind speed dependence
+abstract type GT end
 
-k(T, uₐᵥ, Sc_params) = 0.39 * (0.01 / 3600) * uₐᵥ ^ 2 * (Sc(T, Sc_params) / 660) ^ (-0.5)# m/s, may want to add variable wind speed instead of average wind here at some point
+struct Wanninkhof1992 <: GT end
+struct Wanninkhof2014 <: GT end
+
+#Implement a generic function for k that dispatches on the model type
+@inline function k(model::GT, T, uₐᵥ, Sc_params)
+    if model isa Wanninkhof1992
+        return 0.39 * (0.01 / 3600) * uₐᵥ ^ 2 * (Sc(T, Sc_params) / 660) ^ (-0.5)# m/s, may want to add variable wind speed instead of average wind here at some point
+    elseif model isa Wanninkhof2014
+        return 0.251 * (0.01 / 3600) * uₐᵥ ^ 2 * (Sc(T, Sc_params) / 660) ^ (-0.5)# m/s,
+    else
+        error("Unsupported gas transfer model")
+    end
+end
+
 Sc(T, params) = params.A - params.B * T + params.C * T ^ 2 - params.D * T ^ 3
 
 α(T, S, β_params) = β(T + 273.15, S, β_params) * (T + 273.15) * 0.00367#/(T+273.15) - disagree with origional paper but this matches dimensionless Henry coefficiet of 3.2x10⁻² at 298.15K, S=0. See https://www.wikiwand.com/en/Henry%27s_law 
 β(T, S, params) = exp(params.A₁ + params.A₂ * (100 / T) + params.A₃ * log(T / 100) + S * (params.B₁ + params.B₂ * (T / 100) + params.B₃ * (T / 100) ^ 2))
 
 #now fairly sure that this is giving the correct result for CO₂  as βρ is the henrys coefficient which sould be ∼34mol/m³ atm
-K(T, S, uₐᵥ, Sc_params, β_params, ρₒ) = k(T, uₐᵥ, Sc_params) * β(T + 273.15, S, β_params) * ρₒ #L=ρ\_wK₀ ->  https://reader.elsevier.com/reader/sd/pii/0304420374900152 and here K₀=β
+K(model,T, S, uₐᵥ, Sc_params, β_params, ρₒ) = k(model,T, uₐᵥ, Sc_params) * β(T + 273.15, S, β_params) * ρₒ #L=ρ\_wK₀ ->  https://reader.elsevier.com/reader/sd/pii/0304420374900152 and here K₀=β
 
 #####
 ##### Boundary condition setup
 #####
 
-struct GasExchange{G, ScP, βP, FT, AC, AP, PCO} <: Function
+struct GasExchange{G, GT, ScP, βP, FT, AC, AP, PCO} <: Function
     gas :: G
-
+    transfer_velocity :: GT
     schmidt_params :: ScP
     solubility_params :: βP
     ocean_density :: FT
@@ -151,6 +165,7 @@ struct GasExchange{G, ScP, βP, FT, AC, AP, PCO} <: Function
 end
 
 adapt_structure(to, gasexchange::GasExchange) = GasExchange(adapt(to, gasexchange.gas),
+                                                            adapt(to, gasexchange.transfer_velocity),
                                                             adapt(to, gasexchange.schmidt_params),
                                                             adapt(to, gasexchange.solubility_params),
                                                             gasexchange.ocean_density,
@@ -159,8 +174,9 @@ adapt_structure(to, gasexchange::GasExchange) = GasExchange(adapt(to, gasexchang
                                                             gasexchange.average_wind_speed,
                                                             adapt(to, gasexchange.pCO₂))
 
-"""
+
     GasExchange(; gas,
+                  transfer_velocity::GT = Wanninkhof1992()
                   schmidt_params::ScP = (CO₂ = (A=2073.1, B=125.62, C=3.6276, D=0.043219),
                                    O₂ = (A=1953.4, B=128.0, C=3.9918, D=0.050091))[gas],
                   solubility_params::βP = (CO₂ = (A₁=-60.2409, A₂=93.4517, A₃=23.3585, B₁=0.023517, B₂=-0.023656, B₃=0.0047036),
@@ -178,10 +194,11 @@ Keyword arguments
 =================
 
 - `gas`: (required) the gas to be exchanged, if `:CO₂` or `:O₂` are specified then all other settings may be infered
+- `transfer_velocity` : gas transfer velocity parameterisation for CO2, options are 'Wanninkhof1992()','Wanninkhof2014()','Ho2006()'
 - `schmidt_params` : named tuple of parameters for calculating the Schmidt number using the parameterisation of [Wanninkhof1992](@citet)
 - `solubility_params` : named tuple of parameters for calculating the solubility (for O₂ the Bunsen solubility and CO₂ K₀, see note)
 - `ocean_density` : density of the ocean in kg/m³
-- `air_concentratio` : concentration of the gas in air in relivant units (i.e. ppmv for CO₂ and mmol O₂/m³ for O₂), can also be a function of x, y, t, or a field
+- `air_concentration` : concentration of the gas in air in relivant units (i.e. ppmv for CO₂ and mmol O₂/m³ for O₂), can also be a function of x, y, t, or a field
 - `air_pressure` : air pressure in atm (only used for CO₂), can also be a function of x, y, t, or a field
 - `average_wind_speed` : average wind speed at 10m used to calculate the gas transfer velocity by the [Wanninkhof1992](@citet) parameterisation
 - `field_dependencies` : tracer fields that gas exchange depends on, if the defaults have different names in your model you can specify as long as they are in the same order
@@ -194,6 +211,7 @@ Keyword arguments
     to overload the `(gasexchange::GasExchange)` function to ensure the correct formulaiton.
 """
 function GasExchange(; gas,
+                       transfer_velocity::GT = Wanninkhof1992(), #default model
                        schmidt_params::ScP = (CO₂ = (A = 2073.1, B = 125.62, C = 3.6276, D = 0.043219),
                                                O₂ = (A = 1953.4, B = 128.0, C = 3.9918, D = 0.050091))[gas],
                        solubility_params::βP = (CO₂ = (A₁ = -60.2409, A₂ = 93.4517, A₃ = 23.3585, B₁ = 0.023517, B₂ = -0.023656, B₃ = 0.0047036),
@@ -208,7 +226,8 @@ function GasExchange(; gas,
     gas = Val(gas)
     G = typeof(gas)
 
-    gasexchange =  GasExchange{G, ScP, βP, FT, AC, AP, PCO}(gas, 
+    gasexchange =  GasExchange{G, GT, ScP, βP, FT, AC, AP, PCO}(gas, 
+                                                            transfer_velocity,
                                                             schmidt_params, 
                                                             solubility_params, 
                                                             ocean_density, 
@@ -226,11 +245,11 @@ end
 end
 
 @inline function (gasexchange::GasExchange)(x, y, t, conc, T, S) 
-    return k(T, gasexchange.average_wind_speed, gasexchange.schmidt_params) * (conc - α(T, S, gasexchange.solubility_params) * get_value(x, y, t, gasexchange.air_concentration))
+    return k(gasexchange.transfer_velocity, T, gasexchange.average_wind_speed, gasexchange.schmidt_params) * (conc - α(T, S, gasexchange.solubility_params) * get_value(x, y, t, gasexchange.air_concentration))
 end
 
 @inline function (gasexchange::GasExchange{<:Val{:CO₂}, <:Any, <:Any, <:Any, <:Any, <:Any})(x, y, t, conc, T, S) 
-    return K(T, S, gasexchange.average_wind_speed, gasexchange.schmidt_params, gasexchange.solubility_params, gasexchange.ocean_density) * (conc - get_value(x, y, t, gasexchange.air_concentration) * get_value(x, y, t, gasexchange.air_pressure)) / 1000#μmol/m²s to mmolC/m²s not sure this is correct
+    return K(gasexchange.transfer_velocity,T, S, gasexchange.average_wind_speed, gasexchange.schmidt_params, gasexchange.solubility_params, gasexchange.ocean_density) * (conc - get_value(x, y, t, gasexchange.air_concentration) * get_value(x, y, t, gasexchange.air_pressure)) / 1000#μmol/m²s to mmolC/m²s not sure this is correct
 end
 
 @inline get_value(x, y, t, air_concentration::Number) = air_concentration
